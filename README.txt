@@ -1,14 +1,11 @@
-DISTRIBUTED HETEROGENEOUS LLM PIPELINE ENGINE (D-HLPE) v2.6
+DISTRIBUTED HETEROGENEOUS LLM PIPELINE ENGINE (D-HLPE) v2.7
 HARDENED PRODUCTION ARCHITECTURE — PhD-LEVEL SECURITY AUDIT & DEPLOYMENT GUIDE
 ===============================================================================
 
 0. QUICK START (idempotent, paste-safe)
 ----------------------------------------
-The worker and master are SEPARATE PROCESSES. Both use mTLS on their
-INBOUND sockets (CERT_REQUIRED).
-
-    ./preflight.sh                     # lint ports + cert SAN/EKU
-    ./make_certs.sh                    # SAN+EKU certs (skips if valid)
+    ./preflight.sh                     # lint ports + cert SAN/EKU/keyUsage
+    ./make_certs.sh                    # SAN+EKU+keyUsage certs
     pip install -r requirements.txt
 
     # Terminal A — worker on :8081
@@ -24,26 +21,40 @@ INBOUND sockets (CERT_REQUIRED).
     # Terminal C — smoke test
     DHLPE_SECRET=testsecret ./smoke_test.sh
 
+WHY THE CA NEEDS keyUsage (v2.7 FIX)
+--------------------------------------
+Python 3.13+ enables ssl.VERIFY_X509_STRICT by default. OpenSSL 3.x then
+rejects any CA certificate that lacks a keyUsage extension, with:
+
+    certificate verify failed: CA cert does not include key usage extension
+
+The v2.7 make_certs.sh emits:
+
+    basicConstraints=critical,CA:TRUE
+    keyUsage=critical,keyCertSign,cRLSign
+    subjectKeyIdentifier=hash
+
+and detects/regenerates any legacy CA that lacks keyUsage. Because the
+leaf certs were signed by the old CA, they are also force-regenerated.
+See RFC 5280 §4.2.1.9 [23] and Python 3.13 enforcement [24].
+
+If you must keep an old CA (not recommended), set DHLPE_ALLOW_LEGACY_CA=1
+when starting the master. That clears VERIFY_X509_STRICT on the client
+context. This weakens TLS validation and should be used only in a lab.
+
 TROUBLESHOOTING
 ---------------
-If ./smoke_test.sh reports "no healthy workers" but step 1 (worker
-heartbeat) succeeds, the master's background probe is failing. In v2.6,
-probe_workers prints every attempt to stderr as [probe] <ip>:<port> -> OK
-or [probe] <ip>:<port> FAILED: <exception>. The last error is also
-included in the 503 detail. To reproduce the exact failure in isolation:
+If ./smoke_test.sh reports "no healthy workers" but step 1 succeeds:
+  1. Watch the master's stderr for [probe] lines.
+  2. Run: python diag_probe.py --workers 127.0.0.1:8081
+  3. If the error is "CA cert does not include key usage extension",
+     run ./make_certs.sh again. It will regenerate the CA and leaves.
 
-    python diag_probe.py --workers 127.0.0.1:8081
-
-diag_probe.py exercises the same httpx mTLS path as the master and
-prints the full traceback on failure.
-
-ROOT CAUSE OF v2.5's 503 (fixed in v2.6):
-    httpx 0.28.x with verify=<SSLContext> does not propagate a pre-loaded
-    client certificate chain (load_cert_chain) to httpcore's TLS layer.
-    The worker rejected the probe with "certificate_required". The fix
-    is to pass cert=(cert_path, key_path) to httpx.AsyncClient
-    explicitly [22], regardless of whether verify= is a path or a
-    pre-built SSLContext.
+If the master still says no healthy workers after regeneration, check:
+  - openssl x509 -in certs/ca.crt -noout -text | grep -A1 "Key Usage"
+    must show "Certificate Sign, CRL Sign".
+  - openssl x509 -in certs/worker.crt -noout -text | grep -A1 "Subject Alternative Name"
+    must show DNS:localhost, DNS:worker, IP:127.0.0.1.
 
 1. HOW WE GOT HERE
 --------------------
@@ -52,7 +63,7 @@ sharding Transformer layers across LAN-connected devices — enables models that
 exceed any individual node's memory. Formalized in Megatron-LM [11],
 demonstrated at the edge by Distributed Llama [5]. Naive pipeline parallelism
 exposes new threats: activation inversion [13], weight theft [14], OEM kill
-of workers [15]. D-HLPE v2.6 mitigates each.
+of workers [15]. D-HLPE v2.7 mitigates each.
 
 2. WHERE WE ARE — MITIGATION MATRIX
 -------------------------------------
@@ -61,6 +72,7 @@ of workers [15]. D-HLPE v2.6 mitigates each.
 | Prompt injection (LLM01:2025)  | Strict Pydantic schema; no dynamic layer selection     | [3]      |
 | Activation inversion           | End-to-end mTLS on BOTH worker and master sockets      | [8],[13] |
 | Weight theft via sniffing      | mTLS on every RPC; no plaintext fallback               | [8],[14] |
+| CA without keyUsage (Py 3.13+) | make_certs.sh emits keyCertSign+cRLSign; regenerates  | [23],[24]|
 | Cert w/o SAN → client rejection| make_certs.sh emits SAN+EKU; regenerates legacy certs  | [19],[20]|
 | Cert w/o EKU → client role err | extendedKeyUsage=serverAuth,clientAuth                 | [21]     |
 | httpx silently drops client c. | Explicit cert=(crt, key) parameter on AsyncClient      | [22]     |
@@ -96,10 +108,10 @@ comparisons.
    partitioner.py       RAM-proportional layer partitioner.
    worker_daemon.py     HTTPS worker with persistent, bounded KV cache.
    master_node.py       HTTPS orchestrator; explicit cert= on httpx;
-                        probe instrumentation.
-   diag_probe.py        Standalone httpx mTLS diagnostic (new in v2.6).
-   make_certs.sh        Idempotent SAN+EKU cert generator.
-   preflight.sh         Lint ports 8080/8081 and cert SAN+EKU.
+                        probe instrumentation; legacy-CA escape hatch.
+   diag_probe.py        Standalone httpx mTLS diagnostic.
+   make_certs.sh        Idempotent SAN+EKU+keyUsage cert generator.
+   preflight.sh         Lint ports 8080/8081 and cert SAN+EKU+keyUsage.
    smoke_test.sh        End-to-end mTLS curl test.
    build_dhlpe.sh       Post-generation helper (certs + commit).
 
@@ -127,6 +139,8 @@ comparisons.
 [20] https://cabforum.org/2016/01/14/ballot-sc12-deprecate-internal-names/
 [21] https://datatracker.ietf.org/doc/html/rfc5280#section-4.2.1.12
 [22] https://www.python-httpx.org/advanced/ssl/#client-side-certificates
+[23] https://datatracker.ietf.org/doc/html/rfc5280#section-4.2.1.9
+[24] https://github.com/elastic/elasticsearch/issues/117769
 
 6. KNOWN REMAINING LIMITS
 ---------------------------

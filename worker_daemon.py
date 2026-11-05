@@ -39,7 +39,7 @@ async def lifespan(app: FastAPI):
     kv_store.clear()
 
 
-app = FastAPI(title="D-HLPE Worker v2.6", lifespan=lifespan)
+app = FastAPI(title="D-HLPE Worker v2.7", lifespan=lifespan)
 
 
 @app.post("/heartbeat")

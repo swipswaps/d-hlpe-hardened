@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# preflight.sh — lint ports 8080/8081 and cert SAN+EKU. Always exits 0.
+# preflight.sh — lint ports 8080/8081 and cert extensions. Always exits 0.
 
 check_port() {
     local port="$1"
@@ -24,6 +24,20 @@ check_port() {
     fi
 }
 
+check_ca() {
+    echo "== certs/ca.crt =="
+    if [ ! -f certs/ca.crt ]; then
+        echo "MISSING; run ./make_certs.sh"
+        return
+    fi
+    if openssl x509 -in certs/ca.crt -noout -text 2>&1 | grep -q "X509v3 Key Usage" \
+       && openssl x509 -in certs/ca.crt -noout -text 2>&1 | grep -q "Certificate Sign"; then
+        echo "OK (keyUsage present)"
+    else
+        echo "MISSING keyUsage; run ./make_certs.sh"
+    fi
+}
+
 check_cert() {
     local name="$1"
     local crt="certs/${name}.crt"
@@ -40,6 +54,7 @@ check_cert() {
 
 check_port 8080
 check_port 8081
+check_ca
 check_cert worker
 check_cert master
 exit 0

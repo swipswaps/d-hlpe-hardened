@@ -1,16 +1,14 @@
 """
 diag_probe.py — Standalone httpx mTLS diagnostic.
 
-Exercises the same httpx code path the master uses for its health probe and
-prints the full exception if it fails. Use this when the master reports
-"no healthy workers" to identify the exact TLS / HTTP failure.
-
 Usage:
     python diag_probe.py --workers 127.0.0.1:8081
-    python diag_probe.py --workers 127.0.0.1:8081 --skip-hostname
+    DHLPE_ALLOW_LEGACY_CA=1 python diag_probe.py --workers 127.0.0.1:8081
 
 Citations:
   [22] https://www.python-httpx.org/advanced/ssl/#client-side-certificates
+  [23] https://datatracker.ietf.org/doc/html/rfc5280#section-4.2.1.9
+  [24] https://github.com/elastic/elasticsearch/issues/117769
 """
 
 import argparse
@@ -23,19 +21,21 @@ import traceback
 import httpx
 
 
-async def run(workers, ca, cert, key, skip_hostname, strict):
+async def run(workers, ca, cert, key, skip_hostname, allow_legacy):
+    ctx = ssl.create_default_context(cafile=ca)
+    ctx.load_cert_chain(cert, key)
+    if allow_legacy:
+        try:
+            ctx.verify_flags &= ~ssl.VERIFY_X509_STRICT
+            print("[diag] VERIFY_X509_STRICT disabled", file=sys.stderr)
+        except AttributeError:
+            pass
     if skip_hostname:
-        ctx = ssl.create_default_context(cafile=ca)
         ctx.check_hostname = False
-        ctx.load_cert_chain(cert, key)
         transport = httpx.AsyncHTTPTransport(verify=ctx, cert=(cert, key))
         client = httpx.AsyncClient(transport=transport, timeout=10.0)
     else:
-        client = httpx.AsyncClient(
-            verify=ca,
-            cert=(cert, key),
-            timeout=10.0,
-        )
+        client = httpx.AsyncClient(verify=ctx, cert=(cert, key), timeout=10.0)
 
     rc = 0
     for w in workers:
@@ -59,12 +59,12 @@ def main():
     ap.add_argument("--key", default="certs/master.key")
     ap.add_argument("--skip-hostname", action="store_true",
                     default=os.environ.get("DHLPE_SKIP_HOSTNAME", "0") == "1")
-    ap.add_argument("--strict", action="store_true",
-                    default=os.environ.get("DHLPE_STRICT_TLS", "0") == "1")
+    ap.add_argument("--allow-legacy-ca", action="store_true",
+                    default=os.environ.get("DHLPE_ALLOW_LEGACY_CA", "0") == "1")
     args = ap.parse_args()
     rc = asyncio.run(run(
         args.workers.split(","), args.ca, args.cert, args.key,
-        args.skip_hostname, args.strict,
+        args.skip_hostname, args.allow_legacy_ca,
     ))
     sys.exit(rc)
 

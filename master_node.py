@@ -1,22 +1,20 @@
 """
 master_node.py — HTTPS orchestrator with instrumented httpx mTLS client.
 
-PATCH vs v2.5:
-  [A] httpx client passes cert=(cert_path, key_path) explicitly. v2.5 relied
-      on load_cert_chain() on an SSLContext passed via verify=, which httpx
-      0.28.x / httpcore 1.x does not propagate reliably. That caused the
-      worker to reject the master's probe with "certificate_required".
-      See https://www.python-httpx.org/advanced/ssl/#client-side-certificates
-  [B] probe_workers prints [probe] ... to stderr on every attempt.
-  [C] last_probe_error is surfaced in the 503 detail.
+PATCH vs v2.6:
+  [A] Optional DHLPE_ALLOW_LEGACY_CA=1 clears VERIFY_X509_STRICT on the
+      client context, allowing a CA without keyUsage. This is a lab
+      escape hatch; the correct fix is to regenerate the CA with
+      ./make_certs.sh (v2.7 emits keyUsage=critical,keyCertSign,cRLSign).
 
 Citations:
   [3]  https://genai.owasp.org/resource/owasp-top-10-for-llm-applications-2025/
   [6]  https://github.com/encode/uvicorn
   [8]  https://github.com/fastapi/fastapi/discussions/7176
   [17] https://fastapi.tiangolo.com/advanced/events/
-  [19] https://datatracker.ietf.org/doc/html/rfc6125#section-6.4.4
   [22] https://www.python-httpx.org/advanced/ssl/#client-side-certificates
+  [23] https://datatracker.ietf.org/doc/html/rfc5280#section-4.2.1.9
+  [24] https://github.com/elastic/elasticsearch/issues/117769
 """
 
 import argparse
@@ -73,18 +71,32 @@ async def probe_workers():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global http_client, probe_task
-    # PATCH [A]: explicit cert= parameter. See [22].
+    # Build the client context.
+    ctx = ssl.create_default_context(cafile=_ca_path)
+    ctx.load_cert_chain(_cert_path, _key_path)
+
+    # [23][24] Python 3.13+ sets VERIFY_X509_STRICT by default, which
+    # rejects CAs without keyUsage. v2.7 make_certs.sh emits a compliant
+    # CA. If the operator is stuck with an old CA, DHLPE_ALLOW_LEGACY_CA=1
+    # clears the strict flag for this client context only.
+    if os.environ.get("DHLPE_ALLOW_LEGACY_CA", "0") == "1":
+        try:
+            ctx.verify_flags &= ~ssl.VERIFY_X509_STRICT
+            print("[tls] VERIFY_X509_STRICT disabled (legacy CA mode)",
+                  file=sys.stderr)
+        except AttributeError:
+            pass
+
     if os.environ.get("DHLPE_SKIP_HOSTNAME", "0") == "1":
-        ctx = ssl.create_default_context(cafile=_ca_path)
         ctx.check_hostname = False
-        ctx.load_cert_chain(_cert_path, _key_path)
         transport = httpx.AsyncHTTPTransport(
             verify=ctx, cert=(_cert_path, _key_path)
         )
         http_client = httpx.AsyncClient(transport=transport, timeout=30.0)
     else:
+        # [22] explicit cert= parameter for client certificates.
         http_client = httpx.AsyncClient(
-            verify=_ca_path,
+            verify=ctx,
             cert=(_cert_path, _key_path),
             timeout=30.0,
         )
@@ -100,7 +112,7 @@ async def lifespan(app: FastAPI):
         await http_client.aclose()
 
 
-app = FastAPI(title="D-HLPE Master v2.6", lifespan=lifespan)
+app = FastAPI(title="D-HLPE Master v2.7", lifespan=lifespan)
 
 
 @app.post("/v1/chat/completions")

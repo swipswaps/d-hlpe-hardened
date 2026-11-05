@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
-# make_certs.sh — idempotent SAN+EKU mTLS cert generator.
+# make_certs.sh — idempotent SAN+EKU+keyUsage mTLS cert generator.
 # Citations:
 #   [8]  https://github.com/fastapi/fastapi/discussions/7176
 #   [19] https://datatracker.ietf.org/doc/html/rfc6125#section-6.4.4
 #   [20] https://cabforum.org/2016/01/14/ballot-sc12-deprecate-internal-names/
 #   [21] https://datatracker.ietf.org/doc/html/rfc5280#section-4.2.1.12
+#   [23] https://datatracker.ietf.org/doc/html/rfc5280#section-4.2.1.9
+#   [24] https://github.com/elastic/elasticsearch/issues/117769
 # exit 0 at top level (subprocess, not sourced).
 
 if ! command -v openssl > /dev/null; then
@@ -16,6 +18,7 @@ CERT_DIR="certs"
 mkdir -p "${CERT_DIR}"
 CERT_DAYS="${DHLPE_CERT_DAYS:-3650}"
 EXTRA_SANS="${DHLPE_EXTRA_SANS:-}"
+CA_REGENERATED=0
 
 build_sans() {
     local name="$1"
@@ -24,6 +27,14 @@ build_sans() {
         sans="${sans},${EXTRA_SANS}"
     fi
     printf '%s' "${sans}"
+}
+
+ca_has_key_usage() {
+    local crt="${CERT_DIR}/ca.crt"
+    [ -f "${crt}" ] || return 1
+    openssl x509 -in "${crt}" -noout -text 2>&1 | grep -q "X509v3 Key Usage" || return 1
+    openssl x509 -in "${crt}" -noout -text 2>&1 | grep -q "Certificate Sign" || return 1
+    return 0
 }
 
 has_san_and_eku() {
@@ -36,22 +47,47 @@ has_san_and_eku() {
 }
 
 gen_ca() {
+    local need_ca=0
     if [ ! -f "${CERT_DIR}/ca.key" ]; then
         openssl genrsa -out "${CERT_DIR}/ca.key" 4096
+        need_ca=1
     fi
     if [ ! -f "${CERT_DIR}/ca.crt" ]; then
+        need_ca=1
+    elif ! ca_has_key_usage; then
+        echo "certs/ca.crt lacks keyUsage; regenerating CA (v2.7 fix)"
+        need_ca=1
+    fi
+
+    if [ "${need_ca}" -eq 1 ]; then
         openssl req -new -x509 -days "${CERT_DAYS}" \
             -key "${CERT_DIR}/ca.key" -out "${CERT_DIR}/ca.crt" \
             -subj "/CN=D-HLPE-CA" \
-            -addext "basicConstraints=critical,CA:TRUE"
+            -addext "basicConstraints=critical,CA:TRUE" \
+            -addext "keyUsage=critical,keyCertSign,cRLSign" \
+            -addext "subjectKeyIdentifier=hash"
         if [ $? -ne 0 ]; then
+            # Older OpenSSL without -addext: use a config file.
+            cat > "${CERT_DIR}/ca.cnf" <<'CACNF'
+[req]
+distinguished_name = dn
+x509_extensions = v3_ca
+prompt = no
+[dn]
+CN = D-HLPE-CA
+[v3_ca]
+basicConstraints = critical,CA:TRUE
+keyUsage = critical,keyCertSign,cRLSign
+subjectKeyIdentifier = hash
+CACNF
             openssl req -new -x509 -days "${CERT_DAYS}" \
                 -key "${CERT_DIR}/ca.key" -out "${CERT_DIR}/ca.crt" \
-                -subj "/CN=D-HLPE-CA"
+                -config "${CERT_DIR}/ca.cnf"
         fi
-        echo "generated certs/ca.crt"
+        CA_REGENERATED=1
+        echo "generated certs/ca.crt (keyUsage=keyCertSign,cRLSign)"
     else
-        echo "certs/ca.crt already present"
+        echo "certs/ca.crt already present with keyUsage"
     fi
 }
 
@@ -64,12 +100,12 @@ gen_node_cert() {
     local sans
     sans="$(build_sans "${name}")"
 
-    if has_san_and_eku "${crt}"; then
+    if [ "${CA_REGENERATED}" -eq 0 ] && has_san_and_eku "${crt}"; then
         echo "certs/${name}.crt already present with SAN + EKU"
         return 0
     fi
     if [ -f "${crt}" ]; then
-        echo "certs/${name}.crt missing SAN or EKU; regenerating"
+        echo "regenerating certs/${name}.crt (CA regenerated or extensions missing)"
     fi
 
     if [ ! -f "${key}" ]; then
@@ -83,7 +119,7 @@ gen_node_cert() {
         openssl req -new -key "${key}" -out "${csr}" -subj "/CN=${name}"
     fi
 
-    printf 'subjectAltName=%s\nbasicConstraints=CA:FALSE\nextendedKeyUsage=serverAuth,clientAuth\n' \
+    printf 'subjectAltName=%s\nbasicConstraints=CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth,clientAuth\nsubjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid,issuer\n' \
         "${sans}" > "${ext}"
 
     if [ -f "${CERT_DIR}/ca.srl" ]; then
@@ -97,7 +133,7 @@ gen_node_cert() {
     fi
 
     if [ -f "${crt}" ]; then
-        echo "generated certs/${name}.crt (SAN: ${sans}; EKU: serverAuth+clientAuth)"
+        echo "generated certs/${name}.crt (SAN, EKU, keyUsage)"
     else
         echo "ERROR: failed to generate certs/${name}.crt"
     fi

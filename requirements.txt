@@ -1,4 +1,4 @@
-# D-HLPE v2.6 dependencies. See README section 5 for citations.
+# D-HLPE v2.7 dependencies. See README section 5 for citations.
 fastapi>=0.115.0            # lifespan API [17]
 uvicorn[standard]>=0.30.0   # timeout_graceful_shutdown [6]
 pydantic>=2.8.0
