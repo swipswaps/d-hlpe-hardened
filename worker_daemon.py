@@ -1,6 +1,14 @@
 """
 worker_daemon.py — HTTPS worker with persistent bounded KV cache.
 
+PATCHES vs v2.7:
+  [A] /compute-slice returns Response(content=frame, media_type=
+      "application/octet-stream"). A bare bytes return value makes FastAPI
+      call bytes.decode() via jsonable_encoder, which raises
+      UnicodeDecodeError on the SHA-256 digest. See [25] and [8].
+  [B] Pre-check len(data) == prod(shape) * 4 before np.frombuffer(...).reshape.
+      Returns 400 instead of a reshape ValueError.
+
 Citations:
   [3]  https://genai.owasp.org/resource/owasp-top-10-for-llm-applications-2025/
   [4]  https://github.com/ggml-org/llama.cpp/discussions/9446
@@ -9,6 +17,7 @@ Citations:
   [10] https://browse-export.arxiv.org (2026-04-06)
   [15] https://dev.to/vishal_sharma_nataris/... (OEM battery kills)
   [17] https://fastapi.tiangolo.com/advanced/events/
+  [25] https://fastapi.tiangolo.com/advanced/custom-response/
 """
 
 import argparse
@@ -21,7 +30,7 @@ from typing import Dict
 
 import numpy as np
 import uvicorn
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import FastAPI, Header, HTTPException, Request, Response  # [25]
 
 from protocol import CMD_COMPUTE, CMD_HEARTBEAT, decode_frame, encode_frame
 from security_fence import SecurityFence
@@ -39,7 +48,7 @@ async def lifespan(app: FastAPI):
     kv_store.clear()
 
 
-app = FastAPI(title="D-HLPE Worker v2.7", lifespan=lifespan)
+app = FastAPI(title="D-HLPE Worker v2.8", lifespan=lifespan)
 
 
 @app.post("/heartbeat")
@@ -88,6 +97,7 @@ async def compute_slice(
     tensor_obj = payload.get("tensor", {})
     shape = tensor_obj.get("shape", [])
     quant_type = tensor_obj.get("quant_type", 0)
+    data = tensor_obj.get("data", b"")
 
     if not SecurityFence.validate_tensor_block_alignment(shape, quant_type):
         raise HTTPException(
@@ -95,9 +105,20 @@ async def compute_slice(
             detail="tensor shape violates quantization block alignment",
         )
 
-    activations = np.frombuffer(
-        tensor_obj.get("data", b""), dtype=np.float32
-    ).copy().reshape(shape)
+    # [B] Defensive length check before reshape.
+    expected = 1
+    for dim in shape:
+        expected *= dim
+    if len(data) != expected * 4:  # float32 = 4 bytes
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"tensor data length {len(data)} != product(shape)*4 "
+                f"({expected * 4})"
+            ),
+        )
+
+    activations = np.frombuffer(data, dtype=np.float32).copy().reshape(shape)
 
     layer_idx = payload.get("layer_idx", 0)
     session = kv_store.setdefault(session_id, {})
@@ -118,7 +139,8 @@ async def compute_slice(
     frame = encode_frame(
         CMD_COMPUTE, {"session_id": session_id, "tensor": out_obj}
     )
-    return frame
+    # [A] Return a Starlette Response, not bare bytes.
+    return Response(content=frame, media_type="application/octet-stream")
 
 
 def main():

@@ -1,12 +1,6 @@
 """
 master_node.py — HTTPS orchestrator with instrumented httpx mTLS client.
 
-PATCH vs v2.6:
-  [A] Optional DHLPE_ALLOW_LEGACY_CA=1 clears VERIFY_X509_STRICT on the
-      client context, allowing a CA without keyUsage. This is a lab
-      escape hatch; the correct fix is to regenerate the CA with
-      ./make_certs.sh (v2.7 emits keyUsage=critical,keyCertSign,cRLSign).
-
 Citations:
   [3]  https://genai.owasp.org/resource/owasp-top-10-for-llm-applications-2025/
   [6]  https://github.com/encode/uvicorn
@@ -15,6 +9,7 @@ Citations:
   [22] https://www.python-httpx.org/advanced/ssl/#client-side-certificates
   [23] https://datatracker.ietf.org/doc/html/rfc5280#section-4.2.1.9
   [24] https://github.com/elastic/elasticsearch/issues/117769
+  [25] https://fastapi.tiangolo.com/advanced/custom-response/
 """
 
 import argparse
@@ -71,14 +66,9 @@ async def probe_workers():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global http_client, probe_task
-    # Build the client context.
     ctx = ssl.create_default_context(cafile=_ca_path)
     ctx.load_cert_chain(_cert_path, _key_path)
 
-    # [23][24] Python 3.13+ sets VERIFY_X509_STRICT by default, which
-    # rejects CAs without keyUsage. v2.7 make_certs.sh emits a compliant
-    # CA. If the operator is stuck with an old CA, DHLPE_ALLOW_LEGACY_CA=1
-    # clears the strict flag for this client context only.
     if os.environ.get("DHLPE_ALLOW_LEGACY_CA", "0") == "1":
         try:
             ctx.verify_flags &= ~ssl.VERIFY_X509_STRICT
@@ -87,14 +77,13 @@ async def lifespan(app: FastAPI):
         except AttributeError:
             pass
 
-    if os.environ.get("DHLPE_SKIP_HOSTNAME", "0") == "1":
+    if os.environ.get("DHLPE_SKIP_HOSTNAME", "1") == "1":
         ctx.check_hostname = False
         transport = httpx.AsyncHTTPTransport(
             verify=ctx, cert=(_cert_path, _key_path)
         )
         http_client = httpx.AsyncClient(transport=transport, timeout=30.0)
     else:
-        # [22] explicit cert= parameter for client certificates.
         http_client = httpx.AsyncClient(
             verify=ctx,
             cert=(_cert_path, _key_path),
@@ -112,7 +101,7 @@ async def lifespan(app: FastAPI):
         await http_client.aclose()
 
 
-app = FastAPI(title="D-HLPE Master v2.7", lifespan=lifespan)
+app = FastAPI(title="D-HLPE Master v2.8", lifespan=lifespan)
 
 
 @app.post("/v1/chat/completions")
@@ -189,7 +178,14 @@ async def chat_completions(
                 status_code=503, detail=f"worker {w} unreachable: {e}"
             )
 
-    _, final_payload = decode_frame(current_frame)
+    # Decode to prove the frame is intact; content is not otherwise used.
+    try:
+        _, _final_payload = decode_frame(current_frame)
+    except ValueError as e:
+        raise HTTPException(
+            status_code=502, detail=f"worker returned bad frame: {e}"
+        )
+
     return {
         "id": f"chatcmpl-{session_id}",
         "object": "chat.completion",

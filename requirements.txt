@@ -1,5 +1,5 @@
-# D-HLPE v2.7 dependencies. See README section 5 for citations.
-fastapi>=0.115.0            # lifespan API [17]
+# D-HLPE v2.8 dependencies. See README section 5 for citations.
+fastapi>=0.115.0            # lifespan + Response [17],[25]
 uvicorn[standard]>=0.30.0   # timeout_graceful_shutdown [6]
 pydantic>=2.8.0
 httpx>=0.27.0               # async client with mTLS support [8],[22]

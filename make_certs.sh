@@ -7,7 +7,6 @@
 #   [21] https://datatracker.ietf.org/doc/html/rfc5280#section-4.2.1.12
 #   [23] https://datatracker.ietf.org/doc/html/rfc5280#section-4.2.1.9
 #   [24] https://github.com/elastic/elasticsearch/issues/117769
-# exit 0 at top level (subprocess, not sourced).
 
 if ! command -v openssl > /dev/null; then
     echo "openssl not found; install it and re-run ./make_certs.sh"
@@ -55,10 +54,9 @@ gen_ca() {
     if [ ! -f "${CERT_DIR}/ca.crt" ]; then
         need_ca=1
     elif ! ca_has_key_usage; then
-        echo "certs/ca.crt lacks keyUsage; regenerating CA (v2.7 fix)"
+        echo "certs/ca.crt lacks keyUsage; regenerating CA"
         need_ca=1
     fi
-
     if [ "${need_ca}" -eq 1 ]; then
         openssl req -new -x509 -days "${CERT_DAYS}" \
             -key "${CERT_DIR}/ca.key" -out "${CERT_DIR}/ca.crt" \
@@ -67,7 +65,6 @@ gen_ca() {
             -addext "keyUsage=critical,keyCertSign,cRLSign" \
             -addext "subjectKeyIdentifier=hash"
         if [ $? -ne 0 ]; then
-            # Older OpenSSL without -addext: use a config file.
             cat > "${CERT_DIR}/ca.cnf" <<'CACNF'
 [req]
 distinguished_name = dn
@@ -105,9 +102,8 @@ gen_node_cert() {
         return 0
     fi
     if [ -f "${crt}" ]; then
-        echo "regenerating certs/${name}.crt (CA regenerated or extensions missing)"
+        echo "regenerating certs/${name}.crt (CA regenerated or ext missing)"
     fi
-
     if [ ! -f "${key}" ]; then
         openssl genrsa -out "${key}" 2048
     fi

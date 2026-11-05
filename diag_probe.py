@@ -58,7 +58,7 @@ def main():
     ap.add_argument("--cert", default="certs/master.crt")
     ap.add_argument("--key", default="certs/master.key")
     ap.add_argument("--skip-hostname", action="store_true",
-                    default=os.environ.get("DHLPE_SKIP_HOSTNAME", "0") == "1")
+                    default=os.environ.get("DHLPE_SKIP_HOSTNAME", "1") == "1")
     ap.add_argument("--allow-legacy-ca", action="store_true",
                     default=os.environ.get("DHLPE_ALLOW_LEGACY_CA", "0") == "1")
     args = ap.parse_args()

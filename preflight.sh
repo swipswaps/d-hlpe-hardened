@@ -26,10 +26,7 @@ check_port() {
 
 check_ca() {
     echo "== certs/ca.crt =="
-    if [ ! -f certs/ca.crt ]; then
-        echo "MISSING; run ./make_certs.sh"
-        return
-    fi
+    [ -f certs/ca.crt ] || { echo "MISSING; run ./make_certs.sh"; return; }
     if openssl x509 -in certs/ca.crt -noout -text 2>&1 | grep -q "X509v3 Key Usage" \
        && openssl x509 -in certs/ca.crt -noout -text 2>&1 | grep -q "Certificate Sign"; then
         echo "OK (keyUsage present)"
