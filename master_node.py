@@ -1,23 +1,20 @@
 """
-master_node.py — HTTPS orchestrator with instrumented httpx mTLS client.
+master_node.py — HTTPS orchestrator with replay-protected frames.
 
-PATCHES vs v2.8:
-  [A] uvicorn.run(..., timeout_keep_alive=30) [6].
-  [B] httpx.AsyncClient now passes limits=httpx.Limits(
-      max_keepalive_connections=5, keepalive_expiry=20.0) on BOTH
-      construction paths (skip-hostname and strict-hostname). The client
-      recycles idle connections at 20 s, before uvicorn's 30 s server
-      timeout, so the keepalive race disappears deterministically [26].
+v3.1 adds:
+  - nonce + timestamp in every outbound frame (replay protection)
+  - optional --discover via mDNS (RFC 6762)
+  - Content-Length cap on the inbound chat route
+  - rate limiter keyed on the bearer token, bounded
 
 Citations:
-  [3]  https://genai.owasp.org/resource/owasp-top-10-for-llm-applications-2025/
-  [6]  https://www.uvicorn.org/settings/#http
-  [8]  https://github.com/fastapi/fastapi/discussions/7176
-  [17] https://fastapi.tiangolo.com/advanced/events/
-  [22] https://www.python-httpx.org/advanced/ssl/#client-side-certificates
-  [23] https://datatracker.ietf.org/doc/html/rfc5280#section-4.2.1.9
-  [24] https://github.com/elastic/elasticsearch/issues/117769
-  [26] https://www.python-httpx.org/advanced/resource-limits/
+  [3] OWASP LLM Top 10: https://genai.owasp.org/resource/owasp-top-10-for-llm-applications-2025/
+  [6] uvicorn: https://www.uvicorn.org/settings/#http
+  [14] OWASP replay: https://github.com/OWASP/CheatSheetSeries
+  [17] FastAPI lifespan: https://fastapi.tiangolo.com/advanced/events/
+  [22] httpx cert: https://www.python-httpx.org/advanced/ssl/#client-side-certificates
+  [23] RFC 5280 keyUsage: https://datatracker.ietf.org/doc/html/rfc5280#section-4.2.1.9
+  [26] httpx limits: https://www.python-httpx.org/advanced/resource-limits/
 """
 
 import argparse
@@ -27,6 +24,7 @@ import hmac
 import os
 import ssl
 import sys
+import time
 import uuid
 from contextlib import asynccontextmanager
 from typing import List
@@ -47,6 +45,8 @@ probe_task: asyncio.Task = None
 worker_health: dict = {}
 last_probe_error: str = ""
 MAX_TOKENS_HARD_CAP = 4096
+MAX_PROMPT_CHARS = int(os.environ.get("DHLPE_MAX_PROMPT_CHARS", "32768"))
+MAX_BODY_BYTES = int(os.environ.get("DHLPE_MAX_BODY_BYTES", str(16 * 1024 * 1024)))
 
 _ca_path = "certs/ca.crt"
 _cert_path = "certs/master.crt"
@@ -59,9 +59,7 @@ async def probe_workers():
     while True:
         for w in workers:
             try:
-                r = await http_client.post(
-                    f"https://{w}/heartbeat", timeout=5.0
-                )
+                r = await http_client.post(f"https://{w}/heartbeat", timeout=5.0)
                 worker_health[w] = r.status_code == 200
                 print(f"[probe] {w} -> {r.status_code}", file=sys.stderr)
             except Exception as e:
@@ -80,31 +78,21 @@ async def lifespan(app: FastAPI):
     if os.environ.get("DHLPE_ALLOW_LEGACY_CA", "0") == "1":
         try:
             ctx.verify_flags &= ~ssl.VERIFY_X509_STRICT
-            print("[tls] VERIFY_X509_STRICT disabled (legacy CA mode)",
-                  file=sys.stderr)
+            print("[tls] VERIFY_X509_STRICT disabled (legacy CA)", file=sys.stderr)
         except AttributeError:
             pass
 
-    # [B] keepalive_expiry=20 s < uvicorn's timeout_keep_alive=30 s [26].
-    limits = httpx.Limits(
-        max_keepalive_connections=5,
-        keepalive_expiry=20.0,
-    )
+    limits = httpx.Limits(max_keepalive_connections=5, keepalive_expiry=20.0)
 
     if os.environ.get("DHLPE_SKIP_HOSTNAME", "1") == "1":
         ctx.check_hostname = False
         transport = httpx.AsyncHTTPTransport(
-            verify=ctx,
-            cert=(_cert_path, _key_path),
-            limits=limits,
+            verify=ctx, cert=(_cert_path, _key_path), limits=limits
         )
         http_client = httpx.AsyncClient(transport=transport, timeout=30.0)
     else:
         http_client = httpx.AsyncClient(
-            verify=ctx,
-            cert=(_cert_path, _key_path),
-            timeout=30.0,
-            limits=limits,
+            verify=ctx, cert=(_cert_path, _key_path), timeout=30.0, limits=limits
         )
     probe_task = asyncio.create_task(probe_workers())
     try:
@@ -118,14 +106,11 @@ async def lifespan(app: FastAPI):
         await http_client.aclose()
 
 
-app = FastAPI(title="D-HLPE Master v2.9", lifespan=lifespan)
+app = FastAPI(title="D-HLPE Master v3.1", lifespan=lifespan)
 
 
 @app.post("/v1/chat/completions")
-async def chat_completions(
-    request: Request,
-    authorization: str = Header(None),
-):
+async def chat_completions(request: Request, authorization: str = Header(None)):
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="missing bearer token")
     token = authorization.split(" ", 1)[1]
@@ -135,11 +120,24 @@ async def chat_completions(
     if not security_fence.check_rate_limit("token:" + token):
         raise HTTPException(status_code=429, detail="rate limit exceeded")
 
+    cl = request.headers.get("content-length")
+    if cl is not None:
+        try:
+            if int(cl) > MAX_BODY_BYTES:
+                raise HTTPException(status_code=413, detail="body too large")
+        except ValueError:
+            raise HTTPException(status_code=400, detail="bad Content-Length")
+
     body = await request.json()
     messages = body.get("messages", [])
     prompt = messages[-1].get("content", "") if messages else ""
+    if len(prompt) > MAX_PROMPT_CHARS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"prompt exceeds {MAX_PROMPT_CHARS} characters",
+        )
     max_tokens = int(body.get("max_tokens", 256))
-    if max_tokens > MAX_TOKENS_HARD_CAP:  # [3]
+    if max_tokens > MAX_TOKENS_HARD_CAP:
         raise HTTPException(
             status_code=400,
             detail=f"max_tokens exceeds hard cap {MAX_TOKENS_HARD_CAP}",
@@ -154,11 +152,14 @@ async def chat_completions(
         "data": dummy.tobytes(),
     }
 
+    # v3.1: nonce + timestamp are inside the signed body.
     payload = {
         "session_id": session_id,
         "layer_idx": 0,
         "tensor": tensor_obj,
         "max_tokens": max_tokens,
+        "nonce": uuid.uuid4().hex,
+        "timestamp": int(time.time()),
     }
     current_frame = encode_frame(CMD_COMPUTE, payload)
 
@@ -177,17 +178,14 @@ async def chat_completions(
                 headers={
                     "X-Node-Id": "master",
                     "X-Signature": hmac.new(
-                        shared_secret_str.encode(),
-                        current_frame,
-                        hashlib.sha256,
+                        shared_secret_str.encode(), current_frame, hashlib.sha256
                     ).hexdigest(),
                     "Content-Type": "application/octet-stream",
                 },
             )
             if r.status_code != 200:
                 raise HTTPException(
-                    status_code=502,
-                    detail=f"worker {w} returned {r.status_code}",
+                    status_code=502, detail=f"worker {w} returned {r.status_code}"
                 )
             current_frame = r.content
         except httpx.RequestError as e:
@@ -196,11 +194,9 @@ async def chat_completions(
             )
 
     try:
-        _, _final_payload = decode_frame(current_frame)
+        _, _ = decode_frame(current_frame)
     except ValueError as e:
-        raise HTTPException(
-            status_code=502, detail=f"worker returned bad frame: {e}"
-        )
+        raise HTTPException(status_code=502, detail=f"worker returned bad frame: {e}")
 
     return {
         "id": f"chatcmpl-{session_id}",
@@ -224,7 +220,8 @@ def main():
     global _ca_path, _cert_path, _key_path
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--workers", required=True)
+    parser.add_argument("--workers", default="")
+    parser.add_argument("--discover", action="store_true")
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--secret", required=True)
     parser.add_argument("--ca", default="certs/ca.crt")
@@ -232,13 +229,26 @@ def main():
     parser.add_argument("--key", default="certs/master.key")
     args = parser.parse_args()
 
-    workers = args.workers.split(",")
+    workers = [w for w in args.workers.split(",") if w]
+    if args.discover:
+        try:
+            import discovery
+            found = discovery.browse(timeout=3.0)
+            for f in found:
+                if f not in workers:
+                    workers.append(f)
+            print(f"[discover] found {len(found)}: {found}", file=sys.stderr)
+        except Exception as e:
+            print(f"[discover] failed: {type(e).__name__}: {e}", file=sys.stderr)
+    if not workers:
+        print("ERROR: no workers; pass --workers and/or --discover", file=sys.stderr)
+        raise SystemExit(2)
+
     worker_health = {w: True for w in workers}
     shared_secret_str = args.secret
     security_fence = SecurityFence(shared_secret=args.secret)
     _ca_path, _cert_path, _key_path = args.ca, args.cert, args.key
 
-    # [A] timeout_keep_alive=30 > httpx keepalive_expiry=20 [6].
     uvicorn.run(
         app,
         host="0.0.0.0",

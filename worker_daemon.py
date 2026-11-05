@@ -1,20 +1,19 @@
 """
-worker_daemon.py — HTTPS worker with persistent bounded KV cache.
+worker_daemon.py — HTTPS worker with replay protection and bounded intake.
 
-PATCHES vs v2.8:
-  [A] uvicorn.run() adds timeout_keep_alive=30. v2.8's default (5 s)
-      raced httpx's keepalive_expiry (5 s), producing periodic
-      RemoteProtocolError bursts in the master's probe log. See [6].
+v3.1 adds:
+  - rate limit on /heartbeat (was unlimited)
+  - nonce + timestamp check after HMAC verification
+  - Content-Length cap before reading the body
+  - optional mDNS registration
 
 Citations:
-  [3]  https://genai.owasp.org/resource/owasp-top-10-for-llm-applications-2025/
-  [4]  https://github.com/ggml-org/llama.cpp/discussions/9446
-  [6]  https://www.uvicorn.org/settings/#http
-  [8]  https://github.com/fastapi/fastapi/discussions/7176
-  [10] https://browse-export.arxiv.org (2026-04-06)
-  [15] https://dev.to/vishal_sharma_nataris/... (OEM battery kills)
-  [17] https://fastapi.tiangolo.com/advanced/events/
-  [25] https://fastapi.tiangolo.com/advanced/custom-response/
+  [3] OWASP LLM Top 10: https://genai.owasp.org/resource/owasp-top-10-for-llm-applications-2025/
+  [4] llama.cpp RPC: https://github.com/ggml-org/llama.cpp/discussions/9446
+  [6] uvicorn: https://www.uvicorn.org/settings/#http
+  [14] OWASP replay: https://github.com/OWASP/CheatSheetSeries
+  [17] FastAPI lifespan: https://fastapi.tiangolo.com/advanced/events/
+  [25] FastAPI Response: https://fastapi.tiangolo.com/advanced/custom-response/
 """
 
 import argparse
@@ -27,29 +26,46 @@ from typing import Dict
 
 import numpy as np
 import uvicorn
-from fastapi import FastAPI, Header, HTTPException, Request, Response  # [25]
+from fastapi import FastAPI, Header, HTTPException, Request, Response
 
 from protocol import CMD_COMPUTE, CMD_HEARTBEAT, decode_frame, encode_frame
 from security_fence import SecurityFence
 
 MAX_KV_ELEMENTS = int(os.environ.get("DHLPE_MAX_KV_ELEMENTS", str(64 * 1024 * 1024)))
 MAX_TOKENS_PER_REQUEST = int(os.environ.get("DHLPE_MAX_TOKENS_PER_REQUEST", "1024"))
+MAX_BODY_BYTES = int(os.environ.get("DHLPE_MAX_BODY_BYTES", str(16 * 1024 * 1024)))
 
 security_fence: SecurityFence = None
 kv_store: Dict[str, Dict[int, tuple]] = {}
+_mdns = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    yield  # [17]
+    yield
     kv_store.clear()
+    if _mdns is not None:
+        _mdns.close()
 
 
-app = FastAPI(title="D-HLPE Worker v2.9", lifespan=lifespan)
+app = FastAPI(title="D-HLPE Worker v3.1", lifespan=lifespan)
+
+
+def _check_body_size(request: Request) -> None:
+    cl = request.headers.get("content-length")
+    if cl is not None:
+        try:
+            if int(cl) > MAX_BODY_BYTES:
+                raise HTTPException(status_code=413, detail="body too large")
+        except ValueError:
+            raise HTTPException(status_code=400, detail="bad Content-Length")
 
 
 @app.post("/heartbeat")
-async def heartbeat():
+async def heartbeat(request: Request, x_client_ip: str = Header("127.0.0.1")):
+    # v3.1: heartbeat is now rate-limited too.
+    if not security_fence.check_rate_limit("hb:" + x_client_ip):
+        raise HTTPException(status_code=429, detail="rate limit exceeded")
     return {"status": "alive", "ts": time.time(), "sessions": len(kv_store)}
 
 
@@ -60,12 +76,21 @@ async def compute_slice(
     x_node_id: str = Header("unknown"),
     x_client_ip: str = Header("127.0.0.1"),
 ):
-    if not security_fence.check_rate_limit(x_client_ip):
+    if not security_fence.check_rate_limit("cs:" + x_client_ip):
         raise HTTPException(status_code=429, detail="rate limit exceeded")
 
+    _check_body_size(request)
     raw = await request.body()
+    if len(raw) > MAX_BODY_BYTES:
+        raise HTTPException(status_code=413, detail="body too large")
 
-    sig_bytes = bytes.fromhex(x_signature) if x_signature else b""
+    sig_bytes = b""
+    if x_signature:
+        try:
+            sig_bytes = bytes.fromhex(x_signature)
+        except ValueError:
+            raise HTTPException(status_code=403, detail="malformed signature hex")
+
     ed_ok = security_fence.verify_ed25519(x_node_id, raw, sig_bytes)
     hmac_ok = (
         security_fence.verify_hmac_legacy(raw, x_signature)
@@ -83,9 +108,15 @@ async def compute_slice(
     if cmd == CMD_HEARTBEAT:
         return {"status": "ok"}
 
+    # v3.1: replay protection. Nonce and timestamp are inside the signed body.
+    nonce = payload.get("nonce")
+    timestamp = payload.get("timestamp")
+    if not security_fence.check_nonce(nonce, timestamp):
+        raise HTTPException(status_code=409, detail="stale or replayed nonce")
+
     session_id = payload.get("session_id", str(uuid.uuid4()))
     requested_tokens = int(payload.get("max_tokens", 1))
-    if requested_tokens > MAX_TOKENS_PER_REQUEST:  # [3]
+    if requested_tokens > MAX_TOKENS_PER_REQUEST:
         raise HTTPException(
             status_code=400,
             detail=f"max_tokens exceeds worker cap {MAX_TOKENS_PER_REQUEST}",
@@ -105,13 +136,10 @@ async def compute_slice(
     expected = 1
     for dim in shape:
         expected *= dim
-    if len(data) != expected * 4:  # float32 = 4 bytes
+    if len(data) != expected * 4:
         raise HTTPException(
             status_code=400,
-            detail=(
-                f"tensor data length {len(data)} != product(shape)*4 "
-                f"({expected * 4})"
-            ),
+            detail=f"tensor data length {len(data)} != product(shape)*4 ({expected * 4})",
         )
 
     activations = np.frombuffer(data, dtype=np.float32).copy().reshape(shape)
@@ -125,21 +153,19 @@ async def compute_slice(
         raise HTTPException(status_code=507, detail="KV cache capacity exceeded")
     session[layer_idx] = (activations.copy(), activations.copy())
 
-    out = activations * np.float32(1.01)  # forward pass stub
+    out = activations * np.float32(1.01)
     out_obj = {
         "shape": list(out.shape),
         "dtype": "float32",
         "quant_type": quant_type,
         "data": out.tobytes(),
     }
-    frame = encode_frame(
-        CMD_COMPUTE, {"session_id": session_id, "tensor": out_obj}
-    )
+    frame = encode_frame(CMD_COMPUTE, {"session_id": session_id, "tensor": out_obj})
     return Response(content=frame, media_type="application/octet-stream")
 
 
 def main():
-    global security_fence
+    global security_fence, _mdns
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8081)
@@ -147,12 +173,18 @@ def main():
     parser.add_argument("--cert", required=True)
     parser.add_argument("--key", required=True)
     parser.add_argument("--ca", required=True)
+    parser.add_argument("--mdns-name", default="")
     args = parser.parse_args()
 
     security_fence = SecurityFence(shared_secret=args.secret)
 
-    # [A] timeout_keep_alive=30 keeps uvicorn's idle conns alive longer than
-    # httpx's keepalive_expiry=20 s, eliminating the client/server race [6].
+    if args.mdns_name:
+        try:
+            import discovery
+            _mdns = discovery.register(args.port, args.mdns_name)
+        except Exception as e:
+            print(f"[mdns] registration failed: {type(e).__name__}: {e}")
+
     uvicorn.run(
         app,
         host=args.host,
