@@ -1,5 +1,5 @@
 """
-worker_daemon.py — mTLS worker with persistent bounded KV cache.
+worker_daemon.py — HTTPS worker with persistent bounded KV cache.
 
 Citations:
   [3]  https://genai.owasp.org/resource/owasp-top-10-for-llm-applications-2025/
@@ -39,7 +39,7 @@ async def lifespan(app: FastAPI):
     kv_store.clear()
 
 
-app = FastAPI(title="D-HLPE Worker v2.4", lifespan=lifespan)
+app = FastAPI(title="D-HLPE Worker v2.5", lifespan=lifespan)
 
 
 @app.post("/heartbeat")

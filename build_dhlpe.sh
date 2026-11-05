@@ -2,7 +2,7 @@
 # build_dhlpe.sh — post-generation helper. Idempotent.
 # Citation [12]: https://cli.github.com/manual/gh_repo_create
 # PATCH [A]: exit 0 at top level (subprocess, not sourced).
-# PATCH [B]: DHLPE_NO_PUSH=1 short-circuits before any remote work.
+# PATCH [D]: trailer prints ./smoke_test.sh, not a "curl ..." placeholder.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 cd "${SCRIPT_DIR}" || { echo "cannot cd ${SCRIPT_DIR}"; exit 2; }
@@ -14,7 +14,7 @@ fi
 git init
 git add .
 if ! git diff --cached --quiet; then
-    git commit -m "D-HLPE v2.4 post-generation refresh"
+    git commit -m "D-HLPE v2.5 post-generation refresh"
 fi
 
 if [ "${DHLPE_NO_PUSH:-0}" = "1" ]; then
@@ -35,7 +35,7 @@ fi
 REPO_EXISTS=$(gh repo view d-hlpe-hardened --json name --jq .name || true)
 if [ -z "${REPO_EXISTS}" ]; then
     gh repo create d-hlpe-hardened --source . --public --push \
-        --description "Hardened Distributed Heterogeneous LLM Pipeline Engine v2.4"
+        --description "Hardened Distributed Heterogeneous LLM Pipeline Engine v2.5"
     exit 0
 fi
 

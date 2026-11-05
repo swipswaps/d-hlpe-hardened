@@ -1,5 +1,12 @@
 """
-master_node.py — Hardened orchestrator with lifespan-managed probe.
+master_node.py — HTTPS orchestrator with lifespan-managed probe.
+
+PATCH vs v2.4:
+  - uvicorn.run() now passes ssl_certfile/ssl_keyfile/ssl_ca_certs/
+    ssl_cert_reqs=CERT_REQUIRED. v2.4's master was listening on HTTP.
+  - /v1/chat/completions now enforces a per-token rate limit, since
+    request.client.host is None under uvicorn mTLS and cannot be used as
+    a rate-limit key.
 
 Citations:
   [3]  https://genai.owasp.org/resource/owasp-top-10-for-llm-applications-2025/
@@ -79,7 +86,7 @@ async def lifespan(app: FastAPI):
         await http_client.aclose()
 
 
-app = FastAPI(title="D-HLPE Master v2.4", lifespan=lifespan)
+app = FastAPI(title="D-HLPE Master v2.5", lifespan=lifespan)
 
 
 @app.post("/v1/chat/completions")
@@ -92,6 +99,11 @@ async def chat_completions(
     token = authorization.split(" ", 1)[1]
     if not hmac.compare_digest(token.encode(), shared_secret_str.encode()):
         raise HTTPException(status_code=403, detail="invalid cluster secret")
+
+    # Per-token rate limit. request.client.host is None under uvicorn mTLS,
+    # so the bearer token is used as the bucket key.
+    if not security_fence.check_rate_limit("token:" + token):
+        raise HTTPException(status_code=429, detail="rate limit exceeded")
 
     body = await request.json()
     messages = body.get("messages", [])
@@ -188,8 +200,19 @@ def main():
     security_fence = SecurityFence(shared_secret=args.secret)
     _ca_path, _cert_path, _key_path = args.ca, args.cert, args.key
 
+    # PATCH vs v2.4: HTTPS-only inbound + client-cert required on the
+    # master's own socket. ssl_ca_certs must point to the demo CA so that
+    # the client cert (master.crt) is verified against it, not the system
+    # CA store. Without ssl_ca_certs, uvicorn would reject master.crt.
     uvicorn.run(
-        app, host="0.0.0.0", port=args.port, timeout_graceful_shutdown=10
+        app,
+        host="0.0.0.0",
+        port=args.port,
+        ssl_certfile=args.cert,
+        ssl_keyfile=args.key,
+        ssl_ca_certs=args.ca,
+        ssl_cert_reqs=ssl.CERT_REQUIRED,
+        timeout_graceful_shutdown=10,
     )
 
 
