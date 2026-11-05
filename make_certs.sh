@@ -123,7 +123,7 @@ gen_node_cert() {
     local sans
     sans="$(build_sans "${name}")"
 
-    if [ "${CA_REGENERATED}" -eq 0 ] && needs_regen "${crt}"; then
+    if [ "${CA_REGENERATED}" -eq 0 ] && ! needs_regen "${crt}"; then
         echo "certs/${name}.crt already present with SAN + EKU"
         return 0
     fi
