@@ -6,7 +6,7 @@ cd "${SCRIPT_DIR}" || { echo "cannot cd ${SCRIPT_DIR}"; exit 2; }
 git init
 git add .
 if ! git diff --cached --quiet; then
-    git commit -m "D-HLPE v2.8 post-generation refresh"
+    git commit -m "D-HLPE v2.9 post-generation refresh"
 fi
 [ "${DHLPE_NO_PUSH:-0}" = "1" ] && { echo "DHLPE_NO_PUSH=1"; exit 0; }
 command -v gh > /dev/null || { echo "gh not found"; exit 0; }
@@ -14,7 +14,7 @@ gh auth status > /dev/null || { echo "gh not authenticated"; exit 0; }
 REPO_EXISTS=$(gh repo view d-hlpe-hardened --json name --jq .name || true)
 if [ -z "${REPO_EXISTS}" ]; then
     gh repo create d-hlpe-hardened --source . --public --push \
-        --description "Hardened Distributed Heterogeneous LLM Pipeline Engine v2.8"
+        --description "Hardened Distributed Heterogeneous LLM Pipeline Engine v2.9"
     exit 0
 fi
 if ! git remote | grep -q '^origin$'; then

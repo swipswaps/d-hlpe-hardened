@@ -1,18 +1,15 @@
 """
 worker_daemon.py — HTTPS worker with persistent bounded KV cache.
 
-PATCHES vs v2.7:
-  [A] /compute-slice returns Response(content=frame, media_type=
-      "application/octet-stream"). A bare bytes return value makes FastAPI
-      call bytes.decode() via jsonable_encoder, which raises
-      UnicodeDecodeError on the SHA-256 digest. See [25] and [8].
-  [B] Pre-check len(data) == prod(shape) * 4 before np.frombuffer(...).reshape.
-      Returns 400 instead of a reshape ValueError.
+PATCHES vs v2.8:
+  [A] uvicorn.run() adds timeout_keep_alive=30. v2.8's default (5 s)
+      raced httpx's keepalive_expiry (5 s), producing periodic
+      RemoteProtocolError bursts in the master's probe log. See [6].
 
 Citations:
   [3]  https://genai.owasp.org/resource/owasp-top-10-for-llm-applications-2025/
   [4]  https://github.com/ggml-org/llama.cpp/discussions/9446
-  [6]  https://github.com/encode/uvicorn
+  [6]  https://www.uvicorn.org/settings/#http
   [8]  https://github.com/fastapi/fastapi/discussions/7176
   [10] https://browse-export.arxiv.org (2026-04-06)
   [15] https://dev.to/vishal_sharma_nataris/... (OEM battery kills)
@@ -48,7 +45,7 @@ async def lifespan(app: FastAPI):
     kv_store.clear()
 
 
-app = FastAPI(title="D-HLPE Worker v2.8", lifespan=lifespan)
+app = FastAPI(title="D-HLPE Worker v2.9", lifespan=lifespan)
 
 
 @app.post("/heartbeat")
@@ -105,7 +102,6 @@ async def compute_slice(
             detail="tensor shape violates quantization block alignment",
         )
 
-    # [B] Defensive length check before reshape.
     expected = 1
     for dim in shape:
         expected *= dim
@@ -139,7 +135,6 @@ async def compute_slice(
     frame = encode_frame(
         CMD_COMPUTE, {"session_id": session_id, "tensor": out_obj}
     )
-    # [A] Return a Starlette Response, not bare bytes.
     return Response(content=frame, media_type="application/octet-stream")
 
 
@@ -156,6 +151,8 @@ def main():
 
     security_fence = SecurityFence(shared_secret=args.secret)
 
+    # [A] timeout_keep_alive=30 keeps uvicorn's idle conns alive longer than
+    # httpx's keepalive_expiry=20 s, eliminating the client/server race [6].
     uvicorn.run(
         app,
         host=args.host,
@@ -165,6 +162,7 @@ def main():
         ssl_ca_certs=args.ca,
         ssl_cert_reqs=ssl.CERT_REQUIRED,
         timeout_graceful_shutdown=10,
+        timeout_keep_alive=30,
     )
 
 

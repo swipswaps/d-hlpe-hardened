@@ -9,6 +9,7 @@ Citations:
   [22] https://www.python-httpx.org/advanced/ssl/#client-side-certificates
   [23] https://datatracker.ietf.org/doc/html/rfc5280#section-4.2.1.9
   [24] https://github.com/elastic/elasticsearch/issues/117769
+  [26] https://www.python-httpx.org/advanced/resource-limits/
 """
 
 import argparse
@@ -30,12 +31,17 @@ async def run(workers, ca, cert, key, skip_hostname, allow_legacy):
             print("[diag] VERIFY_X509_STRICT disabled", file=sys.stderr)
         except AttributeError:
             pass
+    limits = httpx.Limits(max_keepalive_connections=5, keepalive_expiry=20.0)
     if skip_hostname:
         ctx.check_hostname = False
-        transport = httpx.AsyncHTTPTransport(verify=ctx, cert=(cert, key))
+        transport = httpx.AsyncHTTPTransport(
+            verify=ctx, cert=(cert, key), limits=limits,
+        )
         client = httpx.AsyncClient(transport=transport, timeout=10.0)
     else:
-        client = httpx.AsyncClient(verify=ctx, cert=(cert, key), timeout=10.0)
+        client = httpx.AsyncClient(
+            verify=ctx, cert=(cert, key), timeout=10.0, limits=limits,
+        )
 
     rc = 0
     for w in workers:

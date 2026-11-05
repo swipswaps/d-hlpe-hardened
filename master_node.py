@@ -1,15 +1,23 @@
 """
 master_node.py — HTTPS orchestrator with instrumented httpx mTLS client.
 
+PATCHES vs v2.8:
+  [A] uvicorn.run(..., timeout_keep_alive=30) [6].
+  [B] httpx.AsyncClient now passes limits=httpx.Limits(
+      max_keepalive_connections=5, keepalive_expiry=20.0) on BOTH
+      construction paths (skip-hostname and strict-hostname). The client
+      recycles idle connections at 20 s, before uvicorn's 30 s server
+      timeout, so the keepalive race disappears deterministically [26].
+
 Citations:
   [3]  https://genai.owasp.org/resource/owasp-top-10-for-llm-applications-2025/
-  [6]  https://github.com/encode/uvicorn
+  [6]  https://www.uvicorn.org/settings/#http
   [8]  https://github.com/fastapi/fastapi/discussions/7176
   [17] https://fastapi.tiangolo.com/advanced/events/
   [22] https://www.python-httpx.org/advanced/ssl/#client-side-certificates
   [23] https://datatracker.ietf.org/doc/html/rfc5280#section-4.2.1.9
   [24] https://github.com/elastic/elasticsearch/issues/117769
-  [25] https://fastapi.tiangolo.com/advanced/custom-response/
+  [26] https://www.python-httpx.org/advanced/resource-limits/
 """
 
 import argparse
@@ -77,10 +85,18 @@ async def lifespan(app: FastAPI):
         except AttributeError:
             pass
 
+    # [B] keepalive_expiry=20 s < uvicorn's timeout_keep_alive=30 s [26].
+    limits = httpx.Limits(
+        max_keepalive_connections=5,
+        keepalive_expiry=20.0,
+    )
+
     if os.environ.get("DHLPE_SKIP_HOSTNAME", "1") == "1":
         ctx.check_hostname = False
         transport = httpx.AsyncHTTPTransport(
-            verify=ctx, cert=(_cert_path, _key_path)
+            verify=ctx,
+            cert=(_cert_path, _key_path),
+            limits=limits,
         )
         http_client = httpx.AsyncClient(transport=transport, timeout=30.0)
     else:
@@ -88,6 +104,7 @@ async def lifespan(app: FastAPI):
             verify=ctx,
             cert=(_cert_path, _key_path),
             timeout=30.0,
+            limits=limits,
         )
     probe_task = asyncio.create_task(probe_workers())
     try:
@@ -101,7 +118,7 @@ async def lifespan(app: FastAPI):
         await http_client.aclose()
 
 
-app = FastAPI(title="D-HLPE Master v2.8", lifespan=lifespan)
+app = FastAPI(title="D-HLPE Master v2.9", lifespan=lifespan)
 
 
 @app.post("/v1/chat/completions")
@@ -178,7 +195,6 @@ async def chat_completions(
                 status_code=503, detail=f"worker {w} unreachable: {e}"
             )
 
-    # Decode to prove the frame is intact; content is not otherwise used.
     try:
         _, _final_payload = decode_frame(current_frame)
     except ValueError as e:
@@ -222,6 +238,7 @@ def main():
     security_fence = SecurityFence(shared_secret=args.secret)
     _ca_path, _cert_path, _key_path = args.ca, args.cert, args.key
 
+    # [A] timeout_keep_alive=30 > httpx keepalive_expiry=20 [6].
     uvicorn.run(
         app,
         host="0.0.0.0",
@@ -231,6 +248,7 @@ def main():
         ssl_ca_certs=args.ca,
         ssl_cert_reqs=ssl.CERT_REQUIRED,
         timeout_graceful_shutdown=10,
+        timeout_keep_alive=30,
     )
 
 

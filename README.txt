@@ -1,4 +1,4 @@
-DISTRIBUTED HETEROGENEOUS LLM PIPELINE ENGINE (D-HLPE) v2.8
+DISTRIBUTED HETEROGENEOUS LLM PIPELINE ENGINE (D-HLPE) v2.9
 HARDENED PRODUCTION ARCHITECTURE — PhD-LEVEL SECURITY AUDIT & DEPLOYMENT GUIDE
 ===============================================================================
 
@@ -21,24 +21,41 @@ HARDENED PRODUCTION ARCHITECTURE — PhD-LEVEL SECURITY AUDIT & DEPLOYMENT GUIDE
     # Terminal C — smoke test
     DHLPE_SECRET=testsecret ./smoke_test.sh
 
+v2.9 KEEPALIVE FIX (what changed vs v2.8)
+------------------------------------------
+v2.8 used uvicorn's default timeout_keep_alive=5 s and httpx's default
+keepalive_expiry=5 s. With a 5 s probe interval, the two timers raced and
+produced intermittent bursts of:
+
+    [probe] 127.0.0.1:8081 FAILED: RemoteProtocolError: Server disconnected
+    without sending a response.
+
+v2.9 sets:
+  * uvicorn.run(..., timeout_keep_alive=30) on both worker and master [6].
+  * httpx.Limits(max_keepalive_connections=5, keepalive_expiry=20.0) on
+    both httpx.AsyncClient construction paths in master_node.py [26].
+
+The server holds idle connections for 30 s; the client recycles them at
+20 s. httpx always closes first, so the race disappears deterministically.
+ConnectError still appears (correctly) when a worker is truly offline.
+
 WHY THE WORKER RETURNS A FastAPI Response (v2.8 FIX)
 -----------------------------------------------------
 In v2.7 the worker returned a bare bytes object from /compute-slice.
-FastAPI interprets a bytes return value as JSON-serializable content and
-passes it through jsonable_encoder, which calls bytes.decode(). The SHA-256
-digest inside the frame is not valid UTF-8, so the encoder raised:
+FastAPI interprets bytes as JSON-serializable content and passes it
+through jsonable_encoder, which calls bytes.decode(). The SHA-256 digest
+inside the frame is not valid UTF-8, so the encoder raised:
 
     UnicodeDecodeError: 'utf-8' codec can't decode byte 0xab in position 14
 
-The v2.8 worker returns Response(content=frame, media_type=
-"application/octet-stream"), which bypasses JSON encoding entirely. The
-master then reads r.content as raw bytes and decode_frame() succeeds.
-See [25] and [8].
+The v2.8+ worker returns Response(content=frame, media_type=
+"application/octet-stream"), which bypasses JSON encoding entirely. See
+[25] and [8].
 
 WHY THE CA NEEDS keyUsage (v2.7 FIX)
 --------------------------------------
 Python 3.13+ enables ssl.VERIFY_X509_STRICT by default. OpenSSL 3.x then
-rejects any CA certificate lacking a keyUsage extension. v2.8 make_certs.sh
+rejects any CA certificate lacking a keyUsage extension. make_certs.sh
 emits keyUsage=critical,keyCertSign,cRLSign and regenerates legacy CAs.
 See RFC 5280 §4.2.1.9 [23] and Python 3.13 enforcement [24].
 
@@ -52,11 +69,11 @@ If ./smoke_test.sh reports "no healthy workers":
 
 If the master returns "worker 127.0.0.1:8081 returned 500":
   1. Watch the worker's stderr for the traceback.
-  2. If the error is UnicodeDecodeError inside fastapi/encoders.py, the
-     worker is returning raw bytes from a route; use Response(content=...,
-     media_type="application/octet-stream"). This is fixed in v2.8.
-  3. If the error is a reshape ValueError, check the pre-check in
-     worker_daemon.py compute_slice ([B] in v2.8).
+  2. UnicodeDecodeError in fastapi/encoders.py → wrap the route return in
+     Response(content=..., media_type="application/octet-stream"). Fixed
+     in v2.8+.
+  3. Reshape ValueError → the tensor length pre-check in worker_daemon.py
+     should return 400 instead. If it doesn't, check the v2.8+ worker.
 
 1. HOW WE GOT HERE
 --------------------
@@ -65,7 +82,7 @@ sharding Transformer layers across LAN-connected devices — enables models that
 exceed any individual node's memory. Formalized in Megatron-LM [11],
 demonstrated at the edge by Distributed Llama [5]. Naive pipeline parallelism
 exposes new threats: activation inversion [13], weight theft [14], OEM kill
-of workers [15]. D-HLPE v2.8 mitigates each.
+of workers [15]. D-HLPE v2.9 mitigates each.
 
 2. WHERE WE ARE — MITIGATION MATRIX
 -------------------------------------
@@ -80,6 +97,7 @@ of workers [15]. D-HLPE v2.8 mitigates each.
 | httpx drops client certificate | Explicit cert=(crt, key) parameter on AsyncClient      | [22]     |
 | Bytes route → UnicodeDecodeErr | Response(content=frame, media_type=octet-stream)       | [25]     |
 | Malformed tensor → reshape err | Pre-check len(data) == prod(shape)*4                   | [4]      |
+| Probe keepalive race           | Server 30 s, client 20 s — client recycles first       | [6],[26] |
 | Probe failures invisible       | [probe] stderr + last_probe_error in 503 detail        | —        |
 | RPC SIGABRT (quantization)     | Block-alignment check in security_fence                | [4]      |
 | HMAC forgery by compromised wk | Ed25519 per-node keys (RFC 8032) available             | [2]      |
@@ -101,7 +119,8 @@ length, and SHA-256 checksum before deserializing [7]; the response body is
 an application/octet-stream frame [25], not JSON. Lifespan context managers
 [17] manage the httpx client and the background health probe on the correct
 event loop. hmac.compare_digest [18] is used for all constant-time
-comparisons.
+comparisons. Keepalive timers are aligned so httpx (20 s) always recycles
+idle connections before uvicorn (30 s) closes them [6],[26].
 
 4. FILES
 ----------
@@ -111,10 +130,11 @@ comparisons.
    security_fence.py    Ed25519 + HMAC + block-alignment validation.
    protocol.py          msgpack-numpy binary framing with SHA-256.
    partitioner.py       RAM-proportional layer partitioner.
-   worker_daemon.py     HTTPS worker; /compute-slice returns a binary
-                        Response (octet-stream).
+   worker_daemon.py     HTTPS worker; octet-stream /compute-slice;
+                        timeout_keep_alive=30.
    master_node.py       HTTPS orchestrator; explicit cert= on httpx;
-                        probe instrumentation; legacy-CA escape hatch.
+                        httpx.Limits keepalive=20; probe instrumentation;
+                        timeout_keep_alive=30; legacy-CA escape hatch.
    diag_probe.py        Standalone httpx mTLS diagnostic.
    make_certs.sh        Idempotent SAN+EKU+keyUsage cert generator.
    preflight.sh         Lint ports 8080/8081 and cert extensions.
@@ -128,7 +148,7 @@ comparisons.
 [3]  https://genai.owasp.org/resource/owasp-top-10-for-llm-applications-2025/
 [4]  https://github.com/ggml-org/llama.cpp/discussions/9446
 [5]  https://github.com/zhengpeirong/_distributed-llama
-[6]  https://github.com/encode/uvicorn
+[6]  https://www.uvicorn.org/settings/#http
 [7]  https://datasea.cn (2026-09-21 benchmark)
 [8]  https://github.com/fastapi/fastapi/discussions/7176
 [9]  https://github.com/laurentS/slowapi
@@ -148,6 +168,7 @@ comparisons.
 [23] https://datatracker.ietf.org/doc/html/rfc5280#section-4.2.1.9
 [24] https://github.com/elastic/elasticsearch/issues/117769
 [25] https://fastapi.tiangolo.com/advanced/custom-response/
+[26] https://www.python-httpx.org/advanced/resource-limits/
 
 6. KNOWN REMAINING LIMITS
 ---------------------------
