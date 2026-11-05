@@ -1,8 +1,5 @@
 #!/usr/bin/env bash
 # smoke_test.sh — end-to-end mTLS test of worker (:8081) + master (:8080).
-# Requires both processes already running with the demo certs.
-# No sed, no set -e, no exit 1, no 2>/dev/null.
-
 SECRET="${DHLPE_SECRET:-testsecret}"
 CERT_DIR="${DHLPE_CERT_DIR:-certs}"
 MASTER_HOST="${DHLPE_MASTER_HOST:-localhost}"
@@ -22,5 +19,4 @@ curl -sS -X POST "https://${MASTER_HOST}:8080/v1/chat/completions" \
     --cacert "${CERT_DIR}/ca.crt" \
     --cert "${CERT_DIR}/master.crt" --key "${CERT_DIR}/master.key"
 echo ""
-
 exit 0

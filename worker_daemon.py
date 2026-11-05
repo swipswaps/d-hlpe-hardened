@@ -39,7 +39,7 @@ async def lifespan(app: FastAPI):
     kv_store.clear()
 
 
-app = FastAPI(title="D-HLPE Worker v2.5", lifespan=lifespan)
+app = FastAPI(title="D-HLPE Worker v2.6", lifespan=lifespan)
 
 
 @app.post("/heartbeat")
@@ -134,7 +134,6 @@ def main():
 
     security_fence = SecurityFence(shared_secret=args.secret)
 
-    # mTLS [8]; graceful shutdown bounds OEM-kill zombies [6],[15].
     uvicorn.run(
         app,
         host=args.host,

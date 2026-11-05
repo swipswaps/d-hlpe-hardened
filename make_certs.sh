@@ -1,15 +1,11 @@
 #!/usr/bin/env bash
-# make_certs.sh — idempotent SAN+EKU mTLS cert generator (standalone).
+# make_certs.sh — idempotent SAN+EKU mTLS cert generator.
 # Citations:
 #   [8]  https://github.com/fastapi/fastapi/discussions/7176
 #   [19] https://datatracker.ietf.org/doc/html/rfc6125#section-6.4.4
 #   [20] https://cabforum.org/2016/01/14/ballot-sc12-deprecate-internal-names/
 #   [21] https://datatracker.ietf.org/doc/html/rfc5280#section-4.2.1.12
-# PATCH [A]: exit 0 (runs as subprocess, not sourced).
-# PATCH [B]: SAN on every cert.
-# PATCH [C]: extendedKeyUsage=serverAuth,clientAuth so the cert is valid in
-#            both roles (uvicorn server + curl client).
-# PATCH [D]: regenerate certs missing either SAN or EKU. CA preserved.
+# exit 0 at top level (subprocess, not sourced).
 
 if ! command -v openssl > /dev/null; then
     echo "openssl not found; install it and re-run ./make_certs.sh"
@@ -32,9 +28,7 @@ build_sans() {
 
 has_san_and_eku() {
     local crt="$1"
-    if [ ! -f "${crt}" ]; then
-        return 1
-    fi
+    [ -f "${crt}" ] || return 1
     openssl x509 -in "${crt}" -noout -text 2>&1 | grep -q "Subject Alternative Name" || return 1
     openssl x509 -in "${crt}" -noout -text 2>&1 | grep -q "TLS Web Server Authentication" || return 1
     openssl x509 -in "${crt}" -noout -text 2>&1 | grep -q "TLS Web Client Authentication" || return 1
@@ -89,20 +83,17 @@ gen_node_cert() {
         openssl req -new -key "${key}" -out "${csr}" -subj "/CN=${name}"
     fi
 
-    # [21] RFC 5280 §4.2.1.12 — extendedKeyUsage=serverAuth,clientAuth.
     printf 'subjectAltName=%s\nbasicConstraints=CA:FALSE\nextendedKeyUsage=serverAuth,clientAuth\n' \
         "${sans}" > "${ext}"
 
     if [ -f "${CERT_DIR}/ca.srl" ]; then
         openssl x509 -req -days "${CERT_DAYS}" \
             -in "${csr}" -CA "${CERT_DIR}/ca.crt" -CAkey "${CERT_DIR}/ca.key" \
-            -CAserial "${CERT_DIR}/ca.srl" -out "${crt}" \
-            -extfile "${ext}"
+            -CAserial "${CERT_DIR}/ca.srl" -out "${crt}" -extfile "${ext}"
     else
         openssl x509 -req -days "${CERT_DAYS}" \
             -in "${csr}" -CA "${CERT_DIR}/ca.crt" -CAkey "${CERT_DIR}/ca.key" \
-            -CAcreateserial -out "${crt}" \
-            -extfile "${ext}"
+            -CAcreateserial -out "${crt}" -extfile "${ext}"
     fi
 
     if [ -f "${crt}" ]; then

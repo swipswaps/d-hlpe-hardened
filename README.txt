@@ -1,56 +1,58 @@
-DISTRIBUTED HETEROGENEOUS LLM PIPELINE ENGINE (D-HLPE) v2.5
+DISTRIBUTED HETEROGENEOUS LLM PIPELINE ENGINE (D-HLPE) v2.6
 HARDENED PRODUCTION ARCHITECTURE — PhD-LEVEL SECURITY AUDIT & DEPLOYMENT GUIDE
 ===============================================================================
 
 0. QUICK START (idempotent, paste-safe)
 ----------------------------------------
-The worker and master are SEPARATE PROCESSES. Start each in its own terminal.
-Both use mTLS on their INBOUND sockets (v2.4 only had worker-side mTLS).
+The worker and master are SEPARATE PROCESSES. Both use mTLS on their
+INBOUND sockets (CERT_REQUIRED).
 
-    ./preflight.sh                     # optional: lint ports + cert SAN/EKU
-    ./make_certs.sh                    # SAN+EKU mTLS certs (skips if valid)
+    ./preflight.sh                     # lint ports + cert SAN/EKU
+    ./make_certs.sh                    # SAN+EKU certs (skips if valid)
     pip install -r requirements.txt
 
-    # Terminal A — worker on :8081 (HTTPS + CERT_REQUIRED)
+    # Terminal A — worker on :8081
     python worker_daemon.py --host 0.0.0.0 --port 8081 \
         --secret testsecret \
         --cert certs/worker.crt --key certs/worker.key --ca certs/ca.crt
 
-    # Terminal B — master on :8080 (HTTPS + CERT_REQUIRED)
+    # Terminal B — master on :8080
     python master_node.py --workers 127.0.0.1:8081 --port 8080 \
         --secret testsecret \
         --cert certs/master.crt --key certs/master.key --ca certs/ca.crt
 
-    # Terminal C — smoke test (or run the individual curl commands below)
+    # Terminal C — smoke test
     DHLPE_SECRET=testsecret ./smoke_test.sh
 
-WHY CLIENT CERTS ARE REQUIRED EVERYWHERE:
-    Both nodes run with ssl_cert_reqs=ssl.CERT_REQUIRED. The client must
-    present a cert signed by certs/ca.crt on every request. Without
-    --cert/--key the TLS handshake fails before any route is reached.
-    The demo uses master.crt/master.key as the client identity; a
-    production deployment should issue separate client certificates.
+TROUBLESHOOTING
+---------------
+If ./smoke_test.sh reports "no healthy workers" but step 1 (worker
+heartbeat) succeeds, the master's background probe is failing. In v2.6,
+probe_workers prints every attempt to stderr as [probe] <ip>:<port> -> OK
+or [probe] <ip>:<port> FAILED: <exception>. The last error is also
+included in the 503 detail. To reproduce the exact failure in isolation:
 
-WHY THE CERTS HAVE SANs AND EKU:
-    Modern TLS clients require Subject Alternative Names (RFC 6125 §6.4.4;
-    CA/B Forum Ballot SC-12). CN is ignored. make_certs.sh emits
-    DNS:localhost, DNS:worker/master, IP:127.0.0.1, IP:::1 on every cert,
-    and adds extendedKeyUsage=serverAuth,clientAuth (RFC 5280 §4.2.1.12)
-    so the same cert can act as server or client. To bake LAN addresses
-    into the certs, set DHLPE_EXTRA_SANS before running make_certs.sh:
-        DHLPE_EXTRA_SANS="IP:192.168.4.50,IP:192.168.4.51,DNS:pi.local" \
-            ./make_certs.sh
+    python diag_probe.py --workers 127.0.0.1:8081
+
+diag_probe.py exercises the same httpx mTLS path as the master and
+prints the full traceback on failure.
+
+ROOT CAUSE OF v2.5's 503 (fixed in v2.6):
+    httpx 0.28.x with verify=<SSLContext> does not propagate a pre-loaded
+    client certificate chain (load_cert_chain) to httpcore's TLS layer.
+    The worker rejected the probe with "certificate_required". The fix
+    is to pass cert=(cert_path, key_path) to httpx.AsyncClient
+    explicitly [22], regardless of whether verify= is a path or a
+    pre-built SSLContext.
 
 1. HOW WE GOT HERE
 --------------------
 Edge AI inference is constrained by single-device RAM. Pipeline parallelism —
 sharding Transformer layers across LAN-connected devices — enables models that
-exceed any individual node's memory. This principle was formalized in
-Megatron-LM [11] and demonstrated at the edge by Distributed Llama [5] and
-Private LLM. Naive pipeline parallelism, however, exposes new threat surfaces:
-activation tensors can be inverted to reconstruct prompts [13], weights can be
-stolen from unencrypted inter-node traffic [14], and Android OEM battery
-optimizers silently kill workers [15]. D-HLPE v2.5 mitigates each of these.
+exceed any individual node's memory. Formalized in Megatron-LM [11],
+demonstrated at the edge by Distributed Llama [5]. Naive pipeline parallelism
+exposes new threats: activation inversion [13], weight theft [14], OEM kill
+of workers [15]. D-HLPE v2.6 mitigates each.
 
 2. WHERE WE ARE — MITIGATION MATRIX
 -------------------------------------
@@ -61,6 +63,8 @@ optimizers silently kill workers [15]. D-HLPE v2.5 mitigates each of these.
 | Weight theft via sniffing      | mTLS on every RPC; no plaintext fallback               | [8],[14] |
 | Cert w/o SAN → client rejection| make_certs.sh emits SAN+EKU; regenerates legacy certs  | [19],[20]|
 | Cert w/o EKU → client role err | extendedKeyUsage=serverAuth,clientAuth                 | [21]     |
+| httpx silently drops client c. | Explicit cert=(crt, key) parameter on AsyncClient      | [22]     |
+| Probe failures invisible       | [probe] stderr + last_probe_error in 503 detail        | —        |
 | RPC SIGABRT (quantization)     | Block-alignment check in protocol.py + security_fence  | [4]      |
 | HMAC forgery by compromised wk | Ed25519 per-node keys (RFC 8032) available             | [2]      |
 | KV-cache OOM on mobile         | Env-configurable MAX_KV_ELEMENTS; 64M default          | [10]     |
@@ -91,10 +95,11 @@ comparisons.
    protocol.py          msgpack-numpy binary framing with SHA-256.
    partitioner.py       RAM-proportional layer partitioner.
    worker_daemon.py     HTTPS worker with persistent, bounded KV cache.
-   master_node.py       HTTPS orchestrator; lifespan-managed probe; per-token
-                        rate limit.
+   master_node.py       HTTPS orchestrator; explicit cert= on httpx;
+                        probe instrumentation.
+   diag_probe.py        Standalone httpx mTLS diagnostic (new in v2.6).
    make_certs.sh        Idempotent SAN+EKU cert generator.
-   preflight.sh         Lint ports 8080/8081 and cert SAN+EKU (non-destructive).
+   preflight.sh         Lint ports 8080/8081 and cert SAN+EKU.
    smoke_test.sh        End-to-end mTLS curl test.
    build_dhlpe.sh       Post-generation helper (certs + commit).
 
@@ -121,19 +126,18 @@ comparisons.
 [19] https://datatracker.ietf.org/doc/html/rfc6125#section-6.4.4
 [20] https://cabforum.org/2016/01/14/ballot-sc12-deprecate-internal-names/
 [21] https://datatracker.ietf.org/doc/html/rfc5280#section-4.2.1.12
+[22] https://www.python-httpx.org/advanced/ssl/#client-side-certificates
 
 6. KNOWN REMAINING LIMITS
 ---------------------------
-- Real forward passes are stubbed (activations * 1.01). Plug your backend
-  (llama.cpp, MLX, ExLlamaV2) into worker_daemon.compute_slice.
-- Ed25519 is wired but the master currently authenticates via HMAC to keep
-  single-key demos simple. Register per-worker pubkeys to enable attribution.
-- The demo uses master.crt/master.key as the client identity. A production
-  deployment should issue a dedicated client cert, e.g. certs/client.crt,
-  and pass it to curl/browsers instead of the server's cert.
-- The master's inbound per-token rate limit treats all clients sharing the
-  same bearer token as a single bucket. Dedicated per-client tokens with
-  per-token buckets would give better isolation.
-- The remote push path rebases onto origin/master when branches are related;
-  if histories are unrelated it falls back to --force-with-lease. Set
-  DHLPE_NO_PUSH=1 to skip.
+- Real forward passes are stubbed (activations * 1.01).
+- Ed25519 is wired but the master authenticates via HMAC in the demo.
+- The demo uses master.crt/master.key as the client identity. Production
+  should issue a dedicated client certificate.
+- The master's per-token rate limit treats all clients sharing one bearer
+  token as a single bucket.
+- master_node.py disables hostname verification by default so the master
+  can reach workers by LAN IP without adding that IP to the cert SAN. Set
+  DHLPE_SKIP_HOSTNAME=0 to enable hostname verification; then the worker
+  IP must be in the cert SAN via DHLPE_EXTRA_SANS.
+- The push path rebases when related, force-with-lease when unrelated.

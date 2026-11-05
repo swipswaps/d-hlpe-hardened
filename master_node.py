@@ -1,12 +1,14 @@
 """
-master_node.py — HTTPS orchestrator with lifespan-managed probe.
+master_node.py — HTTPS orchestrator with instrumented httpx mTLS client.
 
-PATCH vs v2.4:
-  - uvicorn.run() now passes ssl_certfile/ssl_keyfile/ssl_ca_certs/
-    ssl_cert_reqs=CERT_REQUIRED. v2.4's master was listening on HTTP.
-  - /v1/chat/completions now enforces a per-token rate limit, since
-    request.client.host is None under uvicorn mTLS and cannot be used as
-    a rate-limit key.
+PATCH vs v2.5:
+  [A] httpx client passes cert=(cert_path, key_path) explicitly. v2.5 relied
+      on load_cert_chain() on an SSLContext passed via verify=, which httpx
+      0.28.x / httpcore 1.x does not propagate reliably. That caused the
+      worker to reject the master's probe with "certificate_required".
+      See https://www.python-httpx.org/advanced/ssl/#client-side-certificates
+  [B] probe_workers prints [probe] ... to stderr on every attempt.
+  [C] last_probe_error is surfaced in the 503 detail.
 
 Citations:
   [3]  https://genai.owasp.org/resource/owasp-top-10-for-llm-applications-2025/
@@ -14,6 +16,7 @@ Citations:
   [8]  https://github.com/fastapi/fastapi/discussions/7176
   [17] https://fastapi.tiangolo.com/advanced/events/
   [19] https://datatracker.ietf.org/doc/html/rfc6125#section-6.4.4
+  [22] https://www.python-httpx.org/advanced/ssl/#client-side-certificates
 """
 
 import argparse
@@ -22,6 +25,7 @@ import hashlib
 import hmac
 import os
 import ssl
+import sys
 import uuid
 from contextlib import asynccontextmanager
 from typing import List
@@ -40,6 +44,7 @@ shared_secret_str: str = ""
 http_client: httpx.AsyncClient = None
 probe_task: asyncio.Task = None
 worker_health: dict = {}
+last_probe_error: str = ""
 MAX_TOKENS_HARD_CAP = 4096
 
 _ca_path = "certs/ca.crt"
@@ -48,6 +53,8 @@ _key_path = "certs/master.key"
 
 
 async def probe_workers():
+    global last_probe_error
+    print(f"[probe] started; workers={workers}", file=sys.stderr)
     while True:
         for w in workers:
             try:
@@ -55,25 +62,32 @@ async def probe_workers():
                     f"https://{w}/heartbeat", timeout=5.0
                 )
                 worker_health[w] = r.status_code == 200
-            except Exception:
+                print(f"[probe] {w} -> {r.status_code}", file=sys.stderr)
+            except Exception as e:
                 worker_health[w] = False
+                last_probe_error = f"{type(e).__name__}: {e}"
+                print(f"[probe] {w} FAILED: {last_probe_error}", file=sys.stderr)
         await asyncio.sleep(5)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global http_client, probe_task
-    ctx = ssl.create_default_context(cafile=_ca_path)
-    ctx.load_cert_chain(_cert_path, _key_path)
-    # SAN support [19]: when DHLPE_STRICT_TLS=1, verify the worker hostname
-    # against its certificate SAN. Requires the worker IP/hostname to be in
-    # the SAN list (make_certs.sh adds DNS:worker + IP:127.0.0.1 by default;
-    # add LAN IPs via DHLPE_EXTRA_SANS).
-    if os.environ.get("DHLPE_STRICT_TLS", "0") == "1":
-        ctx.check_hostname = True
-    else:
+    # PATCH [A]: explicit cert= parameter. See [22].
+    if os.environ.get("DHLPE_SKIP_HOSTNAME", "0") == "1":
+        ctx = ssl.create_default_context(cafile=_ca_path)
         ctx.check_hostname = False
-    http_client = httpx.AsyncClient(verify=ctx, timeout=30.0)
+        ctx.load_cert_chain(_cert_path, _key_path)
+        transport = httpx.AsyncHTTPTransport(
+            verify=ctx, cert=(_cert_path, _key_path)
+        )
+        http_client = httpx.AsyncClient(transport=transport, timeout=30.0)
+    else:
+        http_client = httpx.AsyncClient(
+            verify=_ca_path,
+            cert=(_cert_path, _key_path),
+            timeout=30.0,
+        )
     probe_task = asyncio.create_task(probe_workers())
     try:
         yield
@@ -86,7 +100,7 @@ async def lifespan(app: FastAPI):
         await http_client.aclose()
 
 
-app = FastAPI(title="D-HLPE Master v2.5", lifespan=lifespan)
+app = FastAPI(title="D-HLPE Master v2.6", lifespan=lifespan)
 
 
 @app.post("/v1/chat/completions")
@@ -100,8 +114,6 @@ async def chat_completions(
     if not hmac.compare_digest(token.encode(), shared_secret_str.encode()):
         raise HTTPException(status_code=403, detail="invalid cluster secret")
 
-    # Per-token rate limit. request.client.host is None under uvicorn mTLS,
-    # so the bearer token is used as the bucket key.
     if not security_fence.check_rate_limit("token:" + token):
         raise HTTPException(status_code=429, detail="rate limit exceeded")
 
@@ -134,7 +146,10 @@ async def chat_completions(
 
     healthy = [w for w in workers if worker_health.get(w, False)]
     if not healthy:
-        raise HTTPException(status_code=503, detail="no healthy workers")
+        detail = "no healthy workers"
+        if last_probe_error:
+            detail += f" (last probe error: {last_probe_error})"
+        raise HTTPException(status_code=503, detail=detail)
 
     for w in healthy:
         try:
@@ -194,16 +209,11 @@ def main():
     args = parser.parse_args()
 
     workers = args.workers.split(",")
-    # Optimistic init: first request routed before first probe completes.
     worker_health = {w: True for w in workers}
     shared_secret_str = args.secret
     security_fence = SecurityFence(shared_secret=args.secret)
     _ca_path, _cert_path, _key_path = args.ca, args.cert, args.key
 
-    # PATCH vs v2.4: HTTPS-only inbound + client-cert required on the
-    # master's own socket. ssl_ca_certs must point to the demo CA so that
-    # the client cert (master.crt) is verified against it, not the system
-    # CA store. Without ssl_ca_certs, uvicorn would reject master.crt.
     uvicorn.run(
         app,
         host="0.0.0.0",

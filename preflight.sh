@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# preflight.sh — lint ports 8080/8081 and cert SAN+EKU without killing anything.
-# No sed, no set -e, no exit 1, no 2>/dev/null. Always exits 0.
+# preflight.sh — lint ports 8080/8081 and cert SAN+EKU. Always exits 0.
 
 check_port() {
     local port="$1"
@@ -17,12 +16,11 @@ check_port() {
         if lsof -i :"${port}" | grep -q LISTEN; then
             echo "OCCUPIED"
             lsof -i :"${port}"
-            echo "Free it with: kill <pid shown above>"
         else
             echo "free"
         fi
     else
-        echo "neither ss nor lsof available; install iproute2 or lsof"
+        echo "neither ss nor lsof available"
     fi
 }
 
@@ -30,10 +28,7 @@ check_cert() {
     local name="$1"
     local crt="certs/${name}.crt"
     echo "== certs/${name}.crt =="
-    if [ ! -f "${crt}" ]; then
-        echo "MISSING; run ./make_certs.sh"
-        return
-    fi
+    [ -f "${crt}" ] || { echo "MISSING; run ./make_certs.sh"; return; }
     if openssl x509 -in "${crt}" -noout -text 2>&1 | grep -q "Subject Alternative Name" \
        && openssl x509 -in "${crt}" -noout -text 2>&1 | grep -q "TLS Web Server Authentication" \
        && openssl x509 -in "${crt}" -noout -text 2>&1 | grep -q "TLS Web Client Authentication"; then
