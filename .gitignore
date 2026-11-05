@@ -5,6 +5,7 @@ __pycache__/
 venv/
 certs/
 *.csr
+*.ext
 *.srl
 .env
 *.log

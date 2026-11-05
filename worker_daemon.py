@@ -39,7 +39,7 @@ async def lifespan(app: FastAPI):
     kv_store.clear()
 
 
-app = FastAPI(title="D-HLPE Worker v2.3", lifespan=lifespan)
+app = FastAPI(title="D-HLPE Worker v2.4", lifespan=lifespan)
 
 
 @app.post("/heartbeat")
@@ -97,7 +97,7 @@ async def compute_slice(
 
     activations = np.frombuffer(
         tensor_obj.get("data", b""), dtype=np.float32
-    ).copy().reshape(shape)  # .copy() for writability
+    ).copy().reshape(shape)
 
     layer_idx = payload.get("layer_idx", 0)
     session = kv_store.setdefault(session_id, {})

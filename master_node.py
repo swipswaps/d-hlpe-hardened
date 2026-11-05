@@ -6,12 +6,14 @@ Citations:
   [6]  https://github.com/encode/uvicorn
   [8]  https://github.com/fastapi/fastapi/discussions/7176
   [17] https://fastapi.tiangolo.com/advanced/events/
+  [19] https://datatracker.ietf.org/doc/html/rfc6125#section-6.4.4
 """
 
 import argparse
 import asyncio
 import hashlib
 import hmac
+import os
 import ssl
 import uuid
 from contextlib import asynccontextmanager
@@ -56,9 +58,14 @@ async def lifespan(app: FastAPI):
     global http_client, probe_task
     ctx = ssl.create_default_context(cafile=_ca_path)
     ctx.load_cert_chain(_cert_path, _key_path)
-    # Demo certs use CN=master / CN=worker without SAN IPs; a public
-    # deployment should issue SAN certs and set this back to True. [8]
-    ctx.check_hostname = False
+    # SAN support [19]: when DHLPE_STRICT_TLS=1, verify the worker hostname
+    # against its certificate SAN. Requires the worker IP/hostname to be in
+    # the SAN list (make_certs.sh adds DNS:worker + IP:127.0.0.1 by default;
+    # add LAN IPs via DHLPE_EXTRA_SANS).
+    if os.environ.get("DHLPE_STRICT_TLS", "0") == "1":
+        ctx.check_hostname = True
+    else:
+        ctx.check_hostname = False
     http_client = httpx.AsyncClient(verify=ctx, timeout=30.0)
     probe_task = asyncio.create_task(probe_workers())
     try:
@@ -72,7 +79,7 @@ async def lifespan(app: FastAPI):
         await http_client.aclose()
 
 
-app = FastAPI(title="D-HLPE Master v2.3", lifespan=lifespan)
+app = FastAPI(title="D-HLPE Master v2.4", lifespan=lifespan)
 
 
 @app.post("/v1/chat/completions")
