@@ -430,6 +430,14 @@ F5  "address already in use".  An older process still holds the port. Run
 F6  Permission denied on certs.  The key files must be mode 0600. make_certs.sh
     creates them with the process umask; check with ls -l.
 
+F7  "fatal error in commit_refs" on git push.  This is a server-side
+    reference-update failure, not a local history problem. The pack upload
+    succeeds; only the ref write fails. Do NOT force-push and do NOT delete
+    the repository. Retry later, try a new branch name
+    (git push origin HEAD:refs/heads/<new>), and if it persists open a
+    support ticket citing the commit SHA, the timestamp, and GitHub
+    Community Discussions #212107, #212116, #212106, #212148.
+
 9. OPERATIONAL RUNBOOK
 ----------------------
 ROTATE A NODE KEY
