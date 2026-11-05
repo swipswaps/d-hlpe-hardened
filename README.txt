@@ -1,4 +1,4 @@
-DISTRIBUTED HETEROGENEOUS LLM PIPELINE ENGINE (D-HLPE) v2.2
+DISTRIBUTED HETEROGENEOUS LLM PIPELINE ENGINE (D-HLPE) v2.3
 HARDENED PRODUCTION ARCHITECTURE — PhD-LEVEL SECURITY AUDIT & DEPLOYMENT GUIDE
 ===============================================================================
 
@@ -33,7 +33,7 @@ Megatron-LM [11] and demonstrated at the edge by Distributed Llama [5] and
 Private LLM. Naive pipeline parallelism, however, exposes new threat surfaces:
 activation tensors can be inverted to reconstruct prompts [13], weights can be
 stolen from unencrypted inter-node traffic [14], and Android OEM battery
-optimizers silently kill workers [15]. D-HLPE v2.2 mitigates each of these.
+optimizers silently kill workers [15]. D-HLPE v2.3 mitigates each of these.
 
 2. WHERE WE ARE — MITIGATION MATRIX
 -------------------------------------
@@ -104,3 +104,7 @@ comparisons.
 - The httpx client disables hostname verification (check_hostname=False)
   because the demo certs use CN=master / CN=worker, not SAN IPs. For a
   public deployment, issue certs with SAN IPs and re-enable check_hostname.
+- If the remote GitHub repo was created by an earlier run with a different
+  root commit, the push path rebases the current branch onto origin/master.
+  If histories are unrelated (rebase conflict), it aborts and uses
+  `git push --force-with-lease`. Set `gh auth login` and re-run to push.

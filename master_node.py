@@ -72,7 +72,7 @@ async def lifespan(app: FastAPI):
         await http_client.aclose()
 
 
-app = FastAPI(title="D-HLPE Master v2.2", lifespan=lifespan)
+app = FastAPI(title="D-HLPE Master v2.3", lifespan=lifespan)
 
 
 @app.post("/v1/chat/completions")

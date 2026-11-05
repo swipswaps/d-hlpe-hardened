@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# make_certs.sh — idempotent mTLS cert generator.
+# make_certs.sh — idempotent mTLS cert generator (standalone subprocess).
 # Citation [8]: https://github.com/fastapi/fastapi/discussions/7176
-# No sed, no set -e, no exit 1, no 2>/dev/null.
+# PATCH [A]: `exit 0` instead of `return 0` — this script is run as a
+# subprocess, not sourced, so `return` is a syntax error at file scope.
 
 if ! command -v openssl >/dev/null; then
     echo "openssl not found; install it and re-run ./make_certs.sh"
-    return 0
+    exit 0
 fi
 
 CERT_DIR="certs"
@@ -55,4 +56,4 @@ gen_node_cert() {
 gen_ca
 gen_node_cert master
 gen_node_cert worker
-return 0
+exit 0
