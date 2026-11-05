@@ -36,13 +36,39 @@ ca_has_key_usage() {
     return 0
 }
 
-has_san_and_eku() {
+needs_regen() {
     local crt="$1"
-    [ -f "${crt}" ] || return 1
-    openssl x509 -in "${crt}" -noout -text 2>&1 | grep -q "Subject Alternative Name" || return 1
-    openssl x509 -in "${crt}" -noout -text 2>&1 | grep -q "TLS Web Server Authentication" || return 1
-    openssl x509 -in "${crt}" -noout -text 2>&1 | grep -q "TLS Web Client Authentication" || return 1
-    return 0
+    if [ ! -f "${crt}" ]; then return 0; fi
+    if ! openssl x509 -in "${crt}" -noout -text 2>&1 | grep -q "Subject Alternative Name"; then return 0; fi
+    if ! openssl x509 -in "${crt}" -noout -text 2>&1 | grep -q "TLS Web Server Authentication"; then return 0; fi
+    if ! openssl x509 -in "${crt}" -noout -text 2>&1 | grep -q "TLS Web Client Authentication"; then return 0; fi
+    if [ -n "${EXTRA_SANS}" ]; then
+        local _ifs="${IFS}" entry ip host
+        IFS=','
+        for entry in ${EXTRA_SANS}; do
+            case "${entry}" in
+                IP:*)
+                    ip="${entry#IP:}"
+                    IFS="${_ifs}"
+                    if ! openssl x509 -in "${crt}" -noout -text 2>&1 | grep -qF "IP Address:${ip}"; then
+                        IFS="${_ifs}"; return 0
+                    fi
+                    IFS=','
+                    ;;
+                DNS:*)
+                    host="${entry#DNS:}"
+                    IFS="${_ifs}"
+                    if ! openssl x509 -in "${crt}" -noout -text 2>&1 | grep -qF "DNS:${host}"; then
+                        IFS="${_ifs}"; return 0
+                    fi
+                    IFS=','
+                    ;;
+                *) IFS="${_ifs}"; return 0 ;;
+            esac
+        done
+        IFS="${_ifs}"
+    fi
+    return 1
 }
 
 gen_ca() {
@@ -97,7 +123,7 @@ gen_node_cert() {
     local sans
     sans="$(build_sans "${name}")"
 
-    if [ "${CA_REGENERATED}" -eq 0 ] && has_san_and_eku "${crt}"; then
+    if [ "${CA_REGENERATED}" -eq 0 ] && needs_regen "${crt}"; then
         echo "certs/${name}.crt already present with SAN + EKU"
         return 0
     fi
